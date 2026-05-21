@@ -45,6 +45,8 @@ struct Client {
     conn: quiche::Connection,
 
     partial_responses: HashMap<u64, PartialResponse>,
+
+    next_stream_id: u64,
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
@@ -57,10 +59,22 @@ fn main() {
 
     let cmd = &args.next().unwrap();
 
-    if args.len() != 0 {
-        println!("Usage: {cmd}");
-        println!("\nSee tools/apps/ for more complete implementations.");
-        return;
+    let mut rtp_addr: Option<std::net::SocketAddr> = None;
+    loop {
+        match args.next().as_deref() {
+            Some("--rtp-addr") => {
+                let s = args.next().expect("--rtp-addr requires an address");
+                rtp_addr = Some(s.parse().expect("invalid socket address"));
+            },
+
+            Some(_) => {
+                println!("Usage: {cmd} [--rtp-addr <addr>]");
+                println!("\nSee tools/apps/ for more complete implementations.");
+                return;
+            },
+
+            None => break,
+        }
     }
 
     // Setup the event loop.
@@ -73,6 +87,16 @@ fn main() {
     poll.registry()
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
         .unwrap();
+
+    let opt_rtp_socket = if let Some(addr) = rtp_addr {
+        let mut rtp_sock = mio::net::UdpSocket::bind(addr).unwrap();
+        poll.registry()
+            .register(&mut rtp_sock, mio::Token(1), mio::Interest::READABLE)
+            .unwrap();
+        Some(rtp_sock)
+    } else {
+        None
+    };
 
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -122,20 +146,15 @@ fn main() {
 
         poll.poll(&mut events, timeout).unwrap();
 
+        if events.is_empty() {
+            debug!("timed out");
+
+            clients.values_mut().for_each(|c| c.conn.on_timeout());
+        }
+
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
         'read: loop {
-            // If the event loop reported no events, it means that the timeout
-            // has expired, so handle it without attempting to read packets. We
-            // will then proceed with the send loop.
-            if events.is_empty() {
-                debug!("timed out");
-
-                clients.values_mut().for_each(|c| c.conn.on_timeout());
-
-                break 'read;
-            }
-
             let (len, from) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
 
@@ -273,6 +292,7 @@ fn main() {
                 let client = Client {
                     conn,
                     partial_responses: HashMap::new(),
+                    next_stream_id: 3,
                 };
 
                 clients.insert(scid.clone(), client);
@@ -331,6 +351,45 @@ fn main() {
                         );
 
                         handle_stream(client, s, stream_buf, "examples/root");
+                    }
+                }
+            }
+        }
+
+        // Inject any UDP payload received on the RTP socket as a new QUIC
+        // stream sent to every active client.
+        if let Some(ref rtp_socket) = opt_rtp_socket {
+            loop {
+                let (len, _) = match rtp_socket.recv_from(&mut buf) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            break;
+                        }
+
+                        panic!("rtp recv() failed: {e:?}");
+                    },
+                };
+
+                let data = buf[..len].to_vec();
+
+                for client in clients.values_mut() {
+                    if client.conn.is_established() ||
+                        client.conn.is_in_early_data()
+                    {
+                        let stream_id = client.next_stream_id;
+                        client.next_stream_id += 4;
+
+                        if let Err(e) =
+                            client.conn.stream_send(stream_id, &data, true)
+                        {
+                            error!(
+                                "{} stream send failed: {:?}",
+                                client.conn.trace_id(),
+                                e
+                            );
+                        }
                     }
                 }
             }

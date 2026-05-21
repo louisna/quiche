@@ -41,13 +41,32 @@ fn main() {
 
     let cmd = &args.next().unwrap();
 
-    if args.len() != 1 {
-        println!("Usage: {cmd} URL");
-        println!("\nSee tools/apps/ for more complete implementations.");
-        return;
-    }
+    let url = match args.next() {
+        Some(u) => url::Url::parse(&u).unwrap(),
+        None => {
+            println!("Usage: {cmd} URL [--rtp-addr <addr>]");
+            println!("\nSee tools/apps/ for more complete implementations.");
+            return;
+        },
+    };
 
-    let url = url::Url::parse(&args.next().unwrap()).unwrap();
+    let mut rtp_addr: Option<std::net::SocketAddr> = None;
+    loop {
+        match args.next().as_deref() {
+            Some("--rtp-addr") => {
+                let s = args.next().expect("--rtp-addr requires an address");
+                rtp_addr = Some(s.parse().expect("invalid socket address"));
+            },
+
+            Some(_) => {
+                println!("Usage: {cmd} URL [--rtp-addr <addr>]");
+                println!("\nSee tools/apps/ for more complete implementations.");
+                return;
+            },
+
+            None => break,
+        }
+    }
 
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();
@@ -106,6 +125,16 @@ fn main() {
 
     // Get local address.
     let local_addr = socket.local_addr().unwrap();
+
+    let rtp_socket = rtp_addr.map(|addr| {
+        let bind = match addr {
+            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+            std::net::SocketAddr::V6(_) => "[::]:0",
+        };
+        let sock = std::net::UdpSocket::bind(bind).unwrap();
+        sock.connect(addr).unwrap();
+        sock
+    });
 
     // Create a QUIC connection and initiate handshake.
     let mut conn =
@@ -196,13 +225,15 @@ fn main() {
 
         // Send an HTTP request as soon as the connection is established.
         if conn.is_established() && !req_sent {
-            info!("sending HTTP request for {}", url.path());
-
-            let req = format!("GET {}\r\n", url.path());
-            conn.stream_send(HTTP_REQ_STREAM_ID, req.as_bytes(), true)
-                .unwrap();
-
             req_sent = true;
+
+            if rtp_addr.is_none() {
+                info!("sending HTTP request for {}", url.path());
+
+                let req = format!("GET {}\r\n", url.path());
+                conn.stream_send(HTTP_REQ_STREAM_ID, req.as_bytes(), true)
+                    .unwrap();
+            }
         }
 
         // Process all readable streams.
@@ -219,19 +250,25 @@ fn main() {
                     fin
                 );
 
-                print!("{}", unsafe {
-                    std::str::from_utf8_unchecked(stream_buf)
-                });
+                if let Some(ref rtp_sock) = rtp_socket {
+                    if let Err(e) = rtp_sock.send(stream_buf) {
+                        error!("UDP forward failed: {e:?}");
+                    }
+                } else {
+                    print!("{}", unsafe {
+                        std::str::from_utf8_unchecked(stream_buf)
+                    });
 
-                // The server reported that it has no more data to send, which
-                // we got the full response. Close the connection.
-                if s == HTTP_REQ_STREAM_ID && fin {
-                    info!(
-                        "response received in {:?}, closing...",
-                        req_start.elapsed()
-                    );
+                    // The server reported that it has no more data to send,
+                    // meaning we got the full response. Close the connection.
+                    if s == HTTP_REQ_STREAM_ID && fin {
+                        info!(
+                            "response received in {:?}, closing...",
+                            req_start.elapsed()
+                        );
 
-                    conn.close(true, 0x00, b"kthxbye").unwrap();
+                        conn.close(true, 0x00, b"kthxbye").unwrap();
+                    }
                 }
             }
         }
